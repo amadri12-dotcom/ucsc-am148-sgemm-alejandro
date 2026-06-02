@@ -1,21 +1,5 @@
-"""Student kernels for the SGEMM autograder assignment.
-
-You implement K2 (GMEM coalescing), K3 (shared-memory blocking), K4 (1D
-register tiling), and K5 (2D register tiling) inside this file. The launch
-wrappers, tile-size constants, and signatures are provided — you only edit
-the kernel bodies marked TODO.
-
-K1 (naive) is given as a worked example so you have a reference for the
-numba.cuda @cuda.jit signature every kernel must match.
-
-To check correctness locally before submitting:
-    python sanity_check.py
-
-To submit: push your edits to the main branch of this assignment repo.
-Each push that touches kernels.py triggers the autograder, which runs
-on a Modal A100 40GB and posts your grade as a comment on the commit.
-You have 10 graded submissions per assignment.
-"""
+"""Student kernels for the SGEMM autograder assignment."""
+"""Alejandro Madrigal"""
 import math
 
 from numba import cuda, float32
@@ -72,8 +56,19 @@ def sgemm_coalesced(A, B, C, M, N, K):
     and modulo by BLOCKSIZE. 
     Be careful which one indexes the column.
     """
-    # TODO
-    return
+    tx = cuda.threadIdx.x
+
+    row_in_tile = tx // BLOCKSIZE
+    col_in_tile = tx % BLOCKSIZE
+
+    row = cuda.blockIdx.x * BLOCKSIZE + row_in_tile
+    col = cuda.blockIdx.y * BLOCKSIZE + col_in_tile
+
+    if row < M and col < N:
+        acc = float32(0.0)
+        for kk in range(K):
+            acc += A[row, kk] * B[kk, col]
+        C[row, col] = acc
 
 
 # ── K3: shared-memory cache-blocking (TODO) ─────────────────────────
@@ -97,8 +92,44 @@ def sgemm_smem(A, B, C, M, N, K):
     (BK3, BN3) for Bs.
     Use 0.0 in the SMEM load when the global index is out of bounds.
     """
-    # TODO
-    return
+    As = cuda.shared.array((BM3, BK3), float32)
+    Bs = cuda.shared.array((BK3, BN3), float32)
+
+    tx = cuda.threadIdx.x
+
+    local_row = tx // BN3
+    local_col = tx % BN3
+
+    global_row = cuda.blockIdx.x * BM3 + local_row
+    global_col = cuda.blockIdx.y * BN3 + local_col
+
+    acc = float32(0.0)
+
+    for k0 in range(0, K, BK3):
+        a_row = tx // BK3
+        a_col = tx % BK3
+        b_row = tx // BN3
+        b_col = tx % BN3
+
+        if global_row < M and k0 + a_col < K:
+            As[a_row, a_col] = A[global_row, k0 + a_col]
+        else:
+            As[a_row, a_col] = float32(0.0)
+
+        if k0 + b_row < K and global_col < N:
+            Bs[b_row, b_col] = B[k0 + b_row, global_col]
+        else:
+            Bs[b_row, b_col] = float32(0.0)
+
+        cuda.syncthreads()
+
+        for kk in range(BK3):
+            acc += As[local_row, kk] * Bs[kk, local_col]
+
+        cuda.syncthreads()
+
+    if global_row < M and global_col < N:
+        C[global_row, global_col] = acc
 
 
 # ── K4: 1D register tiling (TODO) ───────────────────────────────────
@@ -123,8 +154,55 @@ def sgemm_1d_tile(A, B, C, M, N, K):
     Use cuda.local.array(TM4, float32) for the per-thread accumulator array.
     Initialize all entries to 0.0 before the K-loop.
     """
-    # TODO
-    return
+    As = cuda.shared.array((BM4, BK4), float32)
+    Bs = cuda.shared.array((BK4, BN4), float32)
+
+    tx = cuda.threadIdx.x
+
+    thread_col = tx % BN4
+    row_group = tx // BN4
+
+    block_row = cuda.blockIdx.y * BM4
+    block_col = cuda.blockIdx.x * BN4
+
+    row_start = block_row + row_group * TM4
+    col = block_col + thread_col
+
+    acc = cuda.local.array(TM4, float32)
+    for i in range(TM4):
+        acc[i] = float32(0.0)
+
+    for k0 in range(0, K, BK4):
+        a_row = tx // BK4
+        a_col = tx % BK4
+
+        b_row = tx // BN4
+        b_col = tx % BN4
+
+        if block_row + a_row < M and k0 + a_col < K:
+            As[a_row, a_col] = A[block_row + a_row, k0 + a_col]
+        else:
+            As[a_row, a_col] = float32(0.0)
+
+        if k0 + b_row < K and block_col + b_col < N:
+            Bs[b_row, b_col] = B[k0 + b_row, block_col + b_col]
+        else:
+            Bs[b_row, b_col] = float32(0.0)
+
+        cuda.syncthreads()
+
+        for kk in range(BK4):
+            b_val = Bs[kk, thread_col]
+            for i in range(TM4):
+                acc[i] += As[row_group * TM4 + i, kk] * b_val
+
+        cuda.syncthreads()
+
+    if col < N:
+        for i in range(TM4):
+            row = row_start + i
+            if row < M:
+                C[row, col] = acc[i]
 
 
 # ── K5: 2D register tiling (TODO) ───────────────────────────────────
@@ -148,8 +226,71 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     For accumulators, use cuda.local.array((TM5, TN5), float32).
     Numba supports tuple-shaped local arrays!
     """
-    # TODO
-    return
+    As = cuda.shared.array((BM5, BK5), float32)
+    Bs = cuda.shared.array((BK5, BN5), float32)
+
+    tx = cuda.threadIdx.x
+
+    col_group = tx % (BN5 // TN5)
+    row_group = tx // (BN5 // TN5)
+
+    block_row = cuda.blockIdx.y * BM5
+    block_col = cuda.blockIdx.x * BN5
+
+    row_start = block_row + row_group * TM5
+    col_start = block_col + col_group * TN5
+
+    acc = cuda.local.array((TM5, TN5), float32)
+    reg_a = cuda.local.array(TM5, float32)
+    reg_b = cuda.local.array(TN5, float32)
+
+    for i in range(TM5):
+        for j in range(TN5):
+            acc[i, j] = float32(0.0)
+
+    for k0 in range(0, K, BK5):
+        for load in range(4):
+            a_idx = tx + load * cuda.blockDim.x
+            a_row = a_idx // BK5
+            a_col = a_idx % BK5
+
+            if block_row + a_row < M and k0 + a_col < K:
+                As[a_row, a_col] = A[block_row + a_row, k0 + a_col]
+            else:
+                As[a_row, a_col] = float32(0.0)
+
+            b_idx = tx + load * cuda.blockDim.x
+            b_row = b_idx // BN5
+            b_col = b_idx % BN5
+
+            if k0 + b_row < K and block_col + b_col < N:
+                Bs[b_row, b_col] = B[k0 + b_row, block_col + b_col]
+            else:
+                Bs[b_row, b_col] = float32(0.0)
+
+        cuda.syncthreads()
+
+        for kk in range(BK5):
+            for i in range(TM5):
+                reg_a[i] = As[row_group * TM5 + i, kk]
+
+            for j in range(TN5):
+                reg_b[j] = Bs[kk, col_group * TN5 + j]
+
+            for i in range(TM5):
+                a_val = reg_a[i]
+                for j in range(TN5):
+                    acc[i, j] += a_val * reg_b[j]
+
+        cuda.syncthreads()
+
+    for i in range(TM5):
+        row = row_start + i
+        if row < M:
+            for j in range(TN5):
+                col = col_start + j
+                if col < N:
+                    C[row, col] = acc[i, j]
 
 
 # ── Launch wrappers (provided — do not edit) ────────────────────────
